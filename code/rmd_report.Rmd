@@ -1,0 +1,914 @@
+---
+title: "DS1 Homework 1 - Supervised & Unsupervised Learning"
+author: "Cosmin Catalin Ticu"
+date: "2/22/2021"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(datasets)
+library(MASS)
+library(ISLR)
+library(caret)
+library(Hmisc)
+library(dplyr)
+library(GGally)
+library(glmnet)
+library(generics)
+library(skimr)
+library(janitor)
+library(factoextra) # provides nice functions for visualizing the output of PCA
+library(NbClust) # for choosing the optimal number of clusters
+library(knitr)
+library(kableExtra)
+library(data.table)
+library(gridExtra)
+
+# load helper functions from DA3
+source("https://raw.githubusercontent.com/cosmin-ticu/DS1_PCA-clustering/main/code/helper/da_helper_functions.R")
+```
+ 
+# Output HTML [here](https://github.com/cosmin-ticu/DS1_PCA-clustering)
+
+# Intro
+
+The full code of this assignment can be found in this [R script](https://github.com/cosmin-ticu/DS1_PCA-clustering/blob/main/code/supervised-linear-penalized-PCA.R) as some outputs were not included in this RMD for the same of cleanliness and ease of reading. The functionality, however, is exactly the same as the R script and therefore they both answer all the questions in the same way. 
+
+# 1. Supervised Learning with Penalized Models & PCA
+
+## a. Data & Predictors
+
+The current dataset comes from NYC Manhattan residential buildings. It offers many numeric and categorical variables to establish the valuation of a certain property. The features need to first be transformed in order to create a predictive model.
+
+As can be seen in the code below, various sparse variables are coerced into fewer categories for prediction's sake. We also group variables accroding to certain categories:
+
+* area variables (measurements)
+
+* zone variables
+
+* building variables
+
+* technical details of building (measurements)
+
+* distance variables
+
+The area and technical variables are first grouped as level form and the explored as log.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# more info about the data here: https://www1.nyc.gov/site/planning/data-maps/open-data/dwn-pluto-mappluto.page
+data <- readRDS(url('http://www.jaredlander.com/data/manhattan_Train.rds')) %>%
+  mutate(logTotalValue = log(TotalValue)) %>%
+  drop_na()
+
+
+# EDA ---------------------------------------------------------------------
+
+# skim(data)
+
+# some occurences are too sparse
+# table(data$LotType)
+
+to_filter <- data %>% 
+  group_by(LotType) %>% 
+  summarise(n = n()) %>% 
+  filter(n < 50)
+
+data <- data %>% mutate(LotType = 
+                          ifelse(LotType %in% to_filter$LotType, 
+                                 "Other Lot Type", LotType))
+
+# table(data$HealthArea)
+
+to_filter <- data %>% 
+  group_by(HealthArea) %>% 
+  summarise(n = n()) %>% 
+  filter(n < 50)
+
+data <- data %>% mutate(HealthArea = 
+                          ifelse(HealthArea %in% to_filter$HealthArea, 
+                                 "Other", HealthArea))
+
+# remove variables with too many missing values
+
+data$ZoneDist4 <- NULL
+data$ZoneDist3 <- NULL
+data$ZoneDist2 <- NULL
+
+# convert binary variables to factor
+
+data <- mutate(data,
+  IrregularLot = as.factor(ifelse(IrregularLot == "Yes",1,0)),
+  Landmark = as.factor(ifelse(Landmark == "Yes",1,0)),
+  HistoricDistrict = as.factor(ifelse(HistoricDistrict == "Yes" ,1,0)),
+  High = as.factor(ifelse(High == T,1,0))) 
+
+
+data <- mutate(data,
+  Council = as.factor(Council),
+  PolicePrct = as.factor(PolicePrct),
+  HealthArea = as.factor(HealthArea)
+)
+
+# data[, sapply(data, class) == 'factor'] # all factor variables are in order
+  
+# coerce easements to factor (it should ideally be factor for ease of interpretation)
+
+data <- mutate(data, Easements = as.factor(ifelse(Easements > 0,1,0)))
+
+# identify the sets of variables for more structured EDA
+
+data <- data %>% rename('Health_local_code' = HealthArea)
+
+area_level_vars <- data[ , grepl( ".Area" , names( data ) ) ] %>% colnames()
+
+technical_level_vars <- c("BldgDepth", "BldgFront", "LotDepth", "LotFront", 
+                          "UnitsTotal",
+                          "UnitsRes", "NumFloors", "NumBldgs")
+
+distance_vars <- c("ZoneDist1", "BuiltFAR", "ResidFAR", "CommFAR", "FacilFAR",
+                   "Proximity")
+
+zone_vars <- c("SchoolDistrict", "Council", "FireService", "PolicePrct", 
+               "Health_local_code",
+               "HistoricDistrict", "Landmark")
+
+building_vars <- c("Class", "LandUse", "Easements", "OwnerType", "Extension",
+                   "IrregularLot", "BasementType", "Built", "High")
+```
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+## plot distribution of numeric variables
+
+# outcome variable
+ggplot(data, aes(x = TotalValue)) + geom_density()+
+  scale_x_continuous(labels=scales::comma)+
+  ggtitle('outcome variable distribution - skewed (as all financial vars')
+ggplot(data, aes(x = logTotalValue)) + geom_density()+
+  ggtitle('outcome variable distribution as log - reduce skew')
+```
+
+Looking at the distribution of the numeric predictors, it becomes apparent that the building technical variables need to be transformed to log as well as the area variables, as evidenced by the distribution plots below. However, distance measures are overall too sparse to be taken as log (we also want consistency and not to have some variables of the same category as one form and others as another form).
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# numeric variables on technical measures -> take log to reduce skew
+ggplot(data = data, aes(x = LotDepth))+
+  geom_histogram()
+
+ggplot(data = data, aes(x = log(LotDepth + 1) ))+
+  geom_histogram()
+
+# numeric variables on area measures -> take log to reduce skew
+ggplot(data = data, aes(x = LotArea))+
+  geom_histogram()
+
+ggplot(data = data, aes(x = log(LotArea + 1)))+
+  geom_histogram()
+
+# numeric variables on distance measures -> don't take log (entries too sparse)
+ggplot(data = data, aes(x = BuiltFAR))+
+  geom_histogram()
+
+ggplot(data = data, aes(x = log(BuiltFAR + 1)))+
+  geom_histogram()
+
+ggplot(data = data, aes(x = ResidFAR))+
+  geom_histogram()
+
+ggplot(data = data, aes(x = log(ResidFAR + 1)))+
+  geom_histogram()
+```
+
+Before splitting the dataset and making the models, look at potential interactions by modelling multicollinearity. Also convert chosen variables to log and make sure to replace NAs or values forced by original zeros; this is the reason to add flags to the values where half of the distribution's minimum was artifically added.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# add the logs of the designated numeric variables variables
+ln_vars <- c(area_level_vars, technical_level_vars)
+
+# flag 0 values for these variables
+data <- data %>% 
+  mutate_at(vars(ln_vars), funs("flag" = ifelse( . == 0, 1, 0 )))
+
+flag_vars <- NULL
+for (i in ln_vars){
+  new <- paste0(i, "_flag")
+  flag_vars <- c(flag_vars, new)
+}
+
+# add logs and replace with NA if it is below or equal to 0
+data <- data %>% 
+  mutate_at(vars(ln_vars), funs("log" = ifelse( . <= 0, NA, log(.))))
+
+ln_vars2 <- NULL
+for (i in ln_vars){
+  new <- paste0(i, "_log")
+  ln_vars2 <- c(ln_vars2, new)
+}
+
+# replace NAs with half of the minimum value of the given column
+data <- data %>% 
+  mutate_at(vars(ln_vars2), funs(ifelse(is.na(.), min(., na.rm = T)/2, .)))
+
+# check all correlations
+ggcorr(data[, colnames(data) %in% ln_vars2])
+
+```
+
+Based on the above correlations, identify interactions.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# include a few noticeable correlations -> potential interactions
+interactions <- c("ResArea_log*NumFloors_log","ResArea_log*UnitsRes_log",
+                  "ResArea_log*UnitsTotal_log","BldgArea_log*NumFloors_log", 
+                  "RetailArea_log*ComArea_log","OtherArea_log*ResArea_log")
+```
+
+## b. Modelling choices and set splits
+
+Set up a 30% training sample and a 70% holdout sample while keeping the target variable's distribution (in log) the same.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# Modeling Choices --------------------------------------------------------
+
+# define sets of predictors
+X1 <- paste0(" ~ ",paste0(c(area_level_vars, building_vars) , collapse = " + "))
+
+X2 <- paste0(" ~ ",paste0(c(ln_vars2, flag_vars, building_vars) ,collapse = " + "))
+
+X3 <- paste0(" ~ ",paste0(c(ln_vars2, flag_vars, building_vars, 
+                            distance_vars, zone_vars)  ,
+                          collapse = " + "))
+
+X4 <- paste0(" ~ ",paste0(c(ln_vars2, flag_vars, building_vars, 
+                            distance_vars, zone_vars, interactions) ,
+                          collapse = " + "))
+
+# Work vs holdout sets
+set.seed(1234)
+train_indices <- as.integer(createDataPartition(data$logTotalValue, 
+                                                p = 0.3, list = FALSE))
+data_work <- data[train_indices, ]
+data_holdout <- data[-train_indices, ]
+
+# set train control for caret
+
+train_control <- trainControl(method = "cv",number = 10,verboseIter = FALSE)  
+```
+
+## c. Run OLS linear regressions on the data using a combination of the above variables
+
+The following models were built and are contrasted on the cross-validated test fold RMSE.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# Linear Regression -------------------------------------------------------
+
+n_folds=10
+# Create the folds
+set.seed(1234)
+
+folds_i <- sample(rep(1:n_folds, length.out = nrow(data_work) ))
+# Create results
+model_results_cv <- list()
+
+
+for (i in (1:4)){
+  model_name <-  paste0("X",i)
+  model_pretty_name <- paste0("(",i,")")
+  
+  yvar <- "logTotalValue"
+  xvars <- eval(parse(text = model_name))
+  formula <- formula(paste0(yvar,xvars))
+  
+  # Initialize values
+  rmse_train <- c()
+  rmse_test <- c()
+  
+  model_work_data <- lm(formula,data = data_work)
+  BIC <- BIC(model_work_data)
+  nvars <- model_work_data$rank -1
+  r2 <- summary(model_work_data)$r.squared
+  
+  # Do the k-fold estimation
+  for (k in 1:n_folds) {
+    test_i <- which(folds_i == k)
+    # Train sample: all except test_i
+    data_train <- data_work[-test_i, ]
+    # Test sample
+    data_test <- data_work[test_i, ]
+    # Estimation and prediction
+    model <- lm(formula,data = data_train)
+    prediction_train <- predict(model, newdata = data_train)
+    prediction_test <- predict(model, newdata = data_test)
+    
+    # Criteria evaluation
+    rmse_train[k] <- mse_lev(prediction_train, data_train[,yvar] %>% pull)**(1/2)
+    rmse_test[k] <- mse_lev(prediction_test, data_test[,yvar] %>% pull)**(1/2)
+    
+  }
+  
+  model_results_cv[[model_name]] <- list(yvar=yvar,xvars=xvars,formula=formula,model_work_data=model_work_data,
+                                         rmse_train = rmse_train,
+                                         rmse_test = rmse_test,BIC = BIC,
+                                         model_name = model_pretty_name, 
+                                         nvars = nvars, r2 = r2)
+}
+
+t1 <- imap(model_results_cv,  ~{
+  as.data.frame(.x[c("rmse_test", "rmse_train")]) %>%
+    dplyr::summarise_all(.funs = mean) %>%
+    mutate("model_name" = .y , "model_pretty_name" = .x[["model_name"]] ,
+           "nvars" = .x[["nvars"]], "r2" = .x[["r2"]], "BIC" = .x[["BIC"]])
+}) %>%
+  bind_rows()
+
+knitr::kable(t1)
+```
+
+According to the table above, we can designate model 4 (with over 200 predictors) as the model of choice. It has a test RMSE of 0.511. Furthermore, from the table above we can see that the RMSE difference between test and train folds is not too large, thus pointing to the fact that overfitting might not be a large issue.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# the model of choice is model 4 with all of the variables and the interactions in place
+# complexity is very high
+
+model_4_vars <- paste0(c(ln_vars2, flag_vars, building_vars, 
+                         distance_vars, zone_vars, interactions) ,
+                       collapse = " + ")
+
+model_4_formula <- formula(paste0("logTotalValue", " ~ ",
+                                  paste0(c(ln_vars2, flag_vars, 
+                                           building_vars, distance_vars, 
+                                           zone_vars, interactions) ,
+                                         collapse = " + ")))
+
+```
+
+## d. Penalized models for prediction
+
+The code for running the penalized models with GLMNET rather than CARET in R can be found in the [R script](https://github.com/cosmin-ticu/DS1_PCA-clustering/blob/main/code/supervised-linear-penalized-PCA.R).
+
+We can now inspect LASSO, Ridge and Elastic Net models using the formula identified in the best OLS model. All of these models employ penalty terms. While with LASSO we will see coefficients go down to zero, because they do not improve the model, with Ridge we will see coefficients get infinitely close to zero, but never reach zero. The Elastic Net model works as a mix between the two penalizing models discussed before.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# CARET Penalized Models ------------------------------------------------------------
+
+## LASSO 
+
+lasso_tune_grid <- expand.grid(
+  "alpha" = c(1),
+  "lambda" = 10^seq(2,-5,length=100)
+)
+
+set.seed(1234)
+system.time({
+  lasso_fit <- caret::train(
+    model_4_formula,
+    data = data_work,
+    method = "glmnet",
+    preProcess = c("center", "scale"),
+    tuneGrid = lasso_tune_grid,
+    trControl = train_control
+  )
+})
+
+ggplot(lasso_fit) + scale_x_log10()
+
+# lasso_fit$finalModel
+```
+
+The LASSO model saw a best lambda (penalty term) of lambda = 0.0001149757 and, of course, the alpha = 1 as this is the common denomination for LASSO. With a mean RMSE of 0.5109011, the LASSO model performs a little better than the OLS.
+
+Above we can see how the RMSE increases as the penalty term becomes larger and larger. The goal here is dimensionality reduction but without jeopardizing too much performance.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+## RIDGE
+
+ridge_tune_grid <- expand.grid(
+  "alpha" = c(0),
+  "lambda" = 10^seq(2,-5,length=100)  
+)
+
+set.seed(1234)
+system.time({
+  ridge_fit <- caret::train(
+    model_4_formula,
+    data = data_work,
+    method = "glmnet",
+    preProcess = c("center", "scale"),
+    tuneGrid = ridge_tune_grid,
+    trControl = train_control
+  )
+})
+
+ggplot(ridge_fit) + scale_x_log10()
+```
+
+The Ridge model saw a best lambda (penalty term) of lambda = 0.1072267 and, of course, the alpha = 0 as this is the common denomination for Ridge With a mean RMSE of 0.524, the Ridge model performs a little worse than the OLS.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+## Elastic Net
+enet_tune_grid <- expand.grid(
+  "alpha" = seq(0, 1, by = 0.1),
+  "lambda" = union(lasso_tune_grid[["lambda"]], ridge_tune_grid[["lambda"]])
+)
+
+set.seed(1234)
+system.time({
+  enet_fit <- caret::train(
+    model_4_formula,
+    data = data_work,
+    method = "glmnet",
+    preProcess = c("center", "scale"),
+    tuneGrid = enet_tune_grid,
+    trControl = train_control
+  )  
+})
+
+ggplot(enet_fit) + scale_x_log10()
+
+# lasso_fit$bestTune
+# ridge_fit$bestTune
+# enet_fit$bestTune
+```
+
+The Elastic Net model saw a best lambda (penalty term) of lambda = 0.0001149757 and the best alpha = 0.9 as this is the common ground between usage of Ridge and LASSO. We can clearly see in this case the prevelance of the LASSO model, as the alpha is not at a 0.5, meaning a perfect 50-50 split between the two penalized algorithms. With a mean RMSE of 0.510, the Elastic Net model performs a little better than the OLS model (and a slight bit better than the LASSO), taking some better performing features from Ridge and some from LASSO.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+## Compare all models
+
+resample_profile <- resamples(
+  list("ridge" = ridge_fit,
+       "lasso" = lasso_fit,
+       "elastic net" = enet_fit
+  )
+) 
+
+summary(resample_profile)
+```
+
+Based on the comparison tables above, we can designate LASSO to be the best performing model according to test fold RMSE. We could compare models accross their R-squared values or their MAEs, however for the sake of this assignment, the model of choice is the coefficient-excluding LASSO, rather than the coefficient size-reducing Ridge.
+
+## e. Inspecting if the models that we trained follow the same performance when applying a "simplest one that is good enough" heuristic
+
+This part of the report concerns the usage of the "oneSE" selection function for lambda as the penalty term. This can be understood as a more aggressive model that either reduces many coefficients or completely removes in a higher proportion than the lambda chosen above. In this case, it is worthwhile to mention that the lambda type used above is that of the best fit, meaning that it reduces dimensionality as much as possible.
+
+We explore the same plots as above in the R script. Here, for tidiness' sake, we exlude the plots of lambda values across the the mean squared errors. Furthermore, the plots available in the R script under the GLMNET version of these predictive models contain plots that showcase both the best fit lambda and the still good enough lambda of the model with less coefficient prevelance.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# Simplest one that is still good enough? ---------------------------------
+
+train_control_1se <- trainControl(method = "cv",number = 10,
+                                  verboseIter = FALSE,
+                                  selectionFunction = "oneSE")
+
+## LASSO 
+
+lasso_tune_grid <- expand.grid(
+  "alpha" = c(1),
+  "lambda" = 10^seq(2,-5,length=100)
+)
+
+set.seed(1234)
+system.time({
+  lasso_fit_1se <- caret::train(
+    model_4_formula,
+    data = data_work,
+    method = "glmnet",
+    preProcess = c("center", "scale"),
+    tuneGrid = lasso_tune_grid,
+    trControl = train_control_1se
+  )
+})
+
+# ggplot(lasso_fit_1se) + scale_x_log10() # this is ran in original R script
+
+## RIDGE
+
+ridge_tune_grid <- expand.grid(
+  "alpha" = c(0),
+  "lambda" = 10^seq(2,-5,length=100)  
+)
+
+set.seed(1234)
+system.time({
+  ridge_fit_1se <- caret::train(
+    model_4_formula,
+    data = data_work,
+    method = "glmnet",
+    preProcess = c("center", "scale"),
+    tuneGrid = ridge_tune_grid,
+    trControl = train_control_1se
+  )
+})
+
+# ggplot(ridge_fit_1se) + scale_x_log10()
+
+
+## Elastic Net
+enet_tune_grid <- expand.grid(
+  "alpha" = seq(0, 1, by = 0.1),
+  "lambda" = union(lasso_tune_grid[["lambda"]], ridge_tune_grid[["lambda"]])
+)
+
+set.seed(1234)
+system.time({
+  enet_fit_1se <- caret::train(
+    model_4_formula,
+    data = data_work,
+    method = "glmnet",
+    preProcess = c("center", "scale"),
+    tuneGrid = enet_tune_grid,
+    trControl = train_control_1se
+  )  
+})
+
+# ggplot(enet_fit_1se) + scale_x_log10()
+
+# lasso_fit_1se$bestTune
+# ridge_fit_1se$bestTune
+# enet_fit_1se$bestTune
+
+## Compare all models - We see an overall increase in RMSE, which is expected
+# but we all see an increase in the R-squared as less penalties are applied 
+# overall, meaning that more coefficients are kept, 
+# thus better fitting the overall pattern
+
+resample_profile_final <- resamples(
+  list("ridge" = ridge_fit,
+       "lasso" = lasso_fit,
+       "elastic net" = enet_fit,
+       "ridge 1se" = ridge_fit_1se,
+       "lasso 1se" = lasso_fit_1se,
+       "elastic net 1se" = enet_fit_1se
+  )
+) 
+
+summary(resample_profile_final)
+```
+
+Comparing all of the penalizing models above, we can see that there is an increase in RMSE, which is expected. But we also see a slight increase in the MAE as more penalties are applied. Overall, this means that less coefficients are kept, thus better fitting the overall pattern rather than a slightly more overfit model (ones using the normal "best fit" lambda).
+
+These models all have comparable performance and the LASSO ran with the "best fit" lambda is still the main model of choice according to cross-validated test RMSE. Some of the "good enough" lambda models actually performed worse than the OLS, which is expected because of the tradeoff between having as many predictors as possible as opposed to trading a slight performance gain for a more simplistic model. Occam's Razor prevails here.
+
+## f. Improving linear regression fit by conducting PCA
+
+The most pressing issue with increasing the performance of any model with PCA is that factor variables all need to be converted to individual dummies so that their numeric values (0 or 1) can be used in the computation of the principal components.
+
+We first take a look at PCA running on the dataset with factor variables. In this case, the preprocessing function of caret finds 27 principal components to be optimal if we want 95% of the variance to be explained. To explain 99.9% of the variance, we use 53 PCs, which are still less than the overall variables that take a numeric and interpretable form by the PCA algorithm (i.e. 63). Thus we can see dimensionality reduction even before converting to a dummy variable dataset.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# PCA ---------------------------------------------------------------------
+
+pre_process <- preProcess(data_work, method = c("center", "scale", "pca"))
+
+# pre_process # 27 PCs are found to be optimal
+
+# pre_process$rotation
+
+pre_process_99 <- preProcess(data_work, method = c("center", "scale", "pca"), 
+                             thresh = 0.999) 
+# 53 PCs are found to be optimal at this threshold
+
+# one extremely pressing issue with PCA is that cannot use factor variables
+# as such, we will need to transpose all of the factor variables into dummy variables
+```
+
+After converting the dataset to including all of the dummy variables, we end up with with 248 predictors. This means that we created a new dataset which needs to be re partitioned.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+#before converting everything to dummy, must get rid of ID and duplicate TotalValue
+# I filtered out some variables
+data$ID <- NULL
+data$TotalValue <- NULL
+
+# drop unused factor levels
+data <- data %>%
+  mutate_at(vars(colnames(data)[sapply(data, is.factor)]), funs(fct_drop))
+
+# Using dummyVars to make factor variables -> make new dataframe basically
+dummies <- dummyVars(model_4_formula, data = data)
+tdf <- cbind("logTotalValue" = data$logTotalValue,
+             predict(dummies,newdata = data) %>% as.data.frame())
+
+tdf$PolicePrct.52 <- NULL # drop one dummy with 0 variance
+
+# Work vs holdout sets - once again for the new dataframe
+set.seed(1234)
+train_indices_dummies <- as.integer(createDataPartition(tdf$logTotalValue, 
+                                                        p = 0.3, list = FALSE))
+data_work_dummies <- tdf[train_indices_dummies, ]
+data_holdout_dummies <- tdf[-train_indices_dummies, ]
+
+pre_process <- preProcess(data_work_dummies, 
+                          method = c("center", "scale", "pca"))
+
+# pre_process # optimal components found at 140 to explain 95% variance
+# 
+# pre_process$rotation
+# 
+# preProcess(data_work_dummies, method = c("center", "scale", "pca"), thresh = 0.8) 
+# optimal at 97 PCs to explain 80% of variance
+
+```
+
+As can be seen above, with the dataset in this dummy variable form, we see a need for 140 PCs to explain 95% of variance and 97 PCs to explain 80% of variance.
+
+As such, we can proceed with predicting OLS using PCA in the preprocessing part.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# Re-run OLS with PCA
+set.seed(1234)
+lm_model_pca_50 <- caret::train(logTotalValue ~ .,
+                      data = data_work_dummies, 
+                      method = "lm", 
+                      trControl = trainControl(
+                        method = "cv", 
+                        number = 10,
+                        preProcOptions = list(pcaComp = 50)),
+                      preProcess = c("center", "scale", "nzv", "pca")
+)
+# lm_model_pca_50
+
+set.seed(1234)
+lm_model_pca_90 <- caret::train(logTotalValue ~ .,
+                                data = data_work_dummies, 
+                                method = "lm", 
+                                trControl = trainControl(
+                                  method = "cv", 
+                                  number = 10,
+                                  preProcOptions = list(pcaComp = 90)),
+                                preProcess = c("center", "scale", "nzv", "pca")
+)
+# lm_model_pca_90
+
+# running lm model prediction with preprocessing from PCA results 
+# in only 91 principal components
+# being computed, while in reality there could be up to 248 PCs
+```
+
+Running lm model prediction with preprocessing from PCA results in only 91 principal components being computed, while in reality there could be up to 248 PCs. For this reason, we need to use the PCR function of caret as the predictive model for OLS with PCA.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# using PCR function to search for the optimal number of features
+
+trctrlWithPCA <- trainControl(method = "cv", number = 10, verboseIter = TRUE)
+tune_grid <- data.frame(ncomp = 60:150)
+
+
+set.seed(1234)
+lm_model_pca_selftune <- caret::train(
+  logTotalValue ~ .,
+  data = data_work_dummies,
+  method = "pcr",
+  preProcess = c("center", "scale"),
+  tuneGrid = tune_grid,
+  trControl = trctrlWithPCA)
+# lm_model_pca_selftune
+# ncomp = 150 is chosen by model as optimal... perhaps a lower threshold would be better
+# when using PCR method, all of the predictors are counted as principal components,
+# while in the case of lm and glmnet models, only 91 variables are taken
+```
+
+ncomp = 150 is chosen by model as optimal... perhaps a lower threshold would be better.
+
+When using PCR method, all of the predictors are counted as principal components, while in the case of lm and glmnet models, only 91 variables are taken
+
+## g. Using PCA on the penalized model - LASSO
+
+For running LASSO with PCA, a total fo 80 principal components were chosen (safe bet for dimensionalty reduction).
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# Pre-process PCA & penalized models --------------------------------------
+
+# Test if applying PCA prior to estimating penalized models result in a better fit
+# LASSO PCA with 80 principal components - safe bet
+
+lasso_tune_grid <- expand.grid(
+  "alpha" = c(1),
+  "lambda" = 10^seq(2,-5,length=100))
+
+set.seed(1234)
+system.time({
+  lasso_fit_pca <- caret::train(
+    logTotalValue ~ .,
+    data = data_work_dummies,
+    method = "glmnet",
+    preProcess = c("center", "scale", "nzv", "pca"),
+    tuneGrid = lasso_tune_grid,
+    trControl = trainControl(method = "cv",number = 10,
+                             preProcOptions = list(pcaComp = 80), 
+                             verboseIter = F)
+  )
+})
+
+# lasso_fit_pca
+
+# Final model evaluation --------------------------------------------------
+
+resample_profile_allmodels <- resamples(
+  list("ridge" = ridge_fit,
+       "lasso" = lasso_fit,
+       "elastic net" = enet_fit,
+       "ridge 1se" = ridge_fit_1se,
+       "lasso 1se" = lasso_fit_1se,
+       "elastic net 1se" = enet_fit_1se,
+       "linear model with 50 PCA"=lm_model_pca_50,
+       "linear model with 90 PCA"=lm_model_pca_90,
+       "linear model with self-tune PCA"=lm_model_pca_selftune,
+       "LASSO with PCA"=lasso_fit_pca
+       
+  )
+) 
+
+summary(resample_profile_allmodels)
+```
+
+In the end, we can see that running the PCA alongside complexity penalizing models does not show a significant increase in performance.
+
+The best model is still ultimately the LASSO, but the initial linear model comes extremely close in ranking, as can be seen in the initial table comparing all of the linear models.
+
+PCA penalized & OLS models performed worse than their respective regular counterparts. It might be the case that adding too much model complexity not only took away any sort of interpretability, while it also overfitted the models, by running both PCA and penalizing algorithms on them. From a pragmatic point of view, the initial OLS should be chosen, but the regular LASSO with "best fit" lambda will be taken to evaluate the holdout set.
+
+## h. The test set (original, without dummy variables for PCA) will be evaluated with the LASSO model without PCA
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+data_holdout$pred_reg_LASSO <- predict(lasso_fit, newdata = data_holdout)
+
+final_RMSE <- RMSE(data_holdout$pred_reg_LASSO,data_holdout$logTotalValue) %>% 
+  round(4)
+final_MAE <-  MAE(data_holdout$pred_reg_LASSO,data_holdout$logTotalValue) %>% 
+  round(4)
+
+# predict also on the dummy dataset using the PCA LASSO
+data_holdout_dummies$pred_reg_LASSO <- predict(lasso_fit_pca, 
+                                               newdata = data_holdout_dummies)
+
+final_RMSE_PCA <- RMSE(data_holdout_dummies$pred_reg_LASSO,
+                       data_holdout_dummies$logTotalValue) %>% round(4)
+final_MAE_PCA <-  MAE(data_holdout_dummies$pred_reg_LASSO,
+                      data_holdout_dummies$logTotalValue) %>% round(4)
+
+HoldoutSumms <- rbind(cbind(final_RMSE,final_MAE),
+                      cbind(final_RMSE_PCA,final_MAE_PCA)) %>% 
+  as.data.frame()
+
+rownames(HoldoutSumms) <- c("Best_LASSO","LASSO_PCA")
+HoldoutSumms
+```
+
+We can finally see a comparison between the LASSO with the level variables and without the PCA and the final complex LASSO PCA model. Overall, we can decide with sticking with penalizing models without running PCA as pooling together these two algorithms might lead to overfitting.
+
+Lastly, we can see comparable performance between the work dataset LASSO model and the holdout set LASSO model. We can attribute part of this close performance to the usage of a large 70% test sample.
+
+# 2. Clustering on the USArrests dataset
+
+The purpose is to observe the effects of running PCA on clustering techniques.
+
+# a. Short data explanation
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+data_arrest <- as.data.table(USArrests)
+
+# skimr::skim(data_arrest)
+
+# data_arrest <- USArrests
+
+# str(data_arrest$Murder) # all variables are numeric
+
+# EDA ---------------------------------------------------------------------
+
+GGally::ggpairs(data_arrest, title = 
+                  "USA arrests data scatters, Densities & correlations")
+
+```
+
+Apart from a correlation matrix which does show some significant association between the murder and the assault variables. it is, however, below the threshold of 90% correlation (usually the benchmark for multicollinearity).
+
+Because k-means clustering uses distance to establish similarities and optimal clustering values, we can proceed by using all of the variables.
+
+Nothing seems entirely skewed.
+
+Scaling will happen through PCA, thus no need for now.
+
+# b. Optimal number of clusters
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE, include=FALSE}
+# Optimal # of clusters ---------------------------------------------------
+
+# run k-means to identify optimal number of clusters
+nb <- NbClust(data_arrest, method = "kmeans",
+              min.nc = 2, max.nc = 48, index = "all")
+```
+
+```{r, cache=TRUE}
+# visualize this better by reducing the maximum number of clusters
+nb <- NbClust(data_arrest, method = "kmeans", 
+              min.nc = 2, max.nc = 10, index = "all")
+
+fviz_nbclust(nb)
+
+```
+
+According to the Hubert Index, the most significant peak between two points is observed when going from 3 clusters to 2 clusters interestingly, we see a smaller peak when forming 5 clusters we will stick with 2 clusters here.
+
+# c. Cluster with k-means and plot urban population versus all the crime-related variables while highlighting clusters.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# K-means clustering ------------------------------------------------------
+
+set.seed(1122)
+km <- kmeans(data_arrest, centers = 2)
+
+data_w_clusters <- cbind(data_arrest, 
+                         data.table("cluster" = factor(km$cluster)))
+
+# Explore significant differences in clustering between Rape and UrbanPop
+ggplot(data_w_clusters, aes(x = UrbanPop, y = Rape, color = cluster)) +
+  geom_point()+
+  ggtitle("differences in clustering between Rape and UrbanPop")
+
+# Explore significant differences in clustering between Assault and UrbanPop
+ggplot(data_w_clusters, aes(x = UrbanPop, y = Assault, color = cluster)) +
+  geom_point()+
+  ggtitle("differences in clustering between Assault and UrbanPop")
+
+# Explore significant differences in clustering between Murder and UrbanPop
+ggplot(data_w_clusters, aes(x = UrbanPop, y = Murder, color = cluster)) +
+  geom_point()+
+  ggtitle("differences in clustering between Murder and UrbanPop")
+```
+
+It is worthwhile to plot with respective cluster centers highlighted
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# Plot with respective cluster centers
+
+centers <- data.table(km$centers)
+
+centers[, cluster := factor("center", levels = c(1, 2, "center"))]
+
+data_w_clusters_centers <- rbind(data_w_clusters, centers)
+
+ggplot(data_w_clusters_centers, 
+       aes(x = Murder, y = UrbanPop,
+           color = cluster,
+           size = ifelse(cluster == "center", 2, 1.5))) + 
+  geom_point()+theme(legend.position = "none")
+
+
+```
+
+We can see the overall trend between the two clusters is that 1 contains might more violent and unsafe states while 2 contains safer states.
+
+# d. Running PCA on the clusters to compare findings
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+# PCA ---------------------------------------------------------------------
+
+pca_result <- prcomp(data_arrest, scale = TRUE)
+first_two_pc <- as_tibble(pca_result$x[, 1:2])
+
+fviz_contrib(pca_result, "var", axes = 1) # All of the crime related variables take a share
+fviz_contrib(pca_result, "var", axes = 2) # UrbanPop prevail here
+```
+
+As can be clearly seen, the contribution of violence variables characterizes the variances explained by the first principal component while the remaining contribution of urban population characterizes the variance explained by the second principal component. In this case, running principal components results in clear-cut distinctions between clusters.
+
+This is further evidenced by plotting all of the states along the coordinates of the PC1 and PC2 graph.
+
+```{r, warning=FALSE, message=FALSE, cache=TRUE}
+
+data_w_clusters_pca <- cbind(data_w_clusters, first_two_pc)
+
+data_w_clusters_pca_states <- data.frame(State = row.names(USArrests), data_w_clusters_pca)
+
+# Plot k-means identified clusters along coordinates of PC1 & PC2
+ggplot(data_w_clusters_pca_states, aes(PC1, PC2,color = cluster)) + 
+  modelr::geom_ref_line(h = 0) +
+  modelr::geom_ref_line(v = 0) +
+  geom_text(aes(label = State), size = 3) +
+  xlab("First Principal Component") + 
+  ylab("Second Principal Component") + 
+  ggtitle("First Two Principal Components of USArrests Data on level clusters")
+# + theme(legend.position = "none")
+
+
+# exploring variance explained by PCs
+Variance <- pca_result$sdev^2
+percentage_variance <- Variance / sum(Variance)
+percentage_variance
+
+
+# Cumulative PVE plot
+qplot(c(1:4), cumsum(percentage_variance)) +
+  geom_line() +
+  xlab("# Principal Component") +
+  ylab(NULL) +
+  ggtitle("Cumulative Explained Variance") +
+  ylim(0,1)
+```
+
+The last plot (above) also shows us the importance of the violence variables as opposed to the urban population variable. A PCA combination of the violence variables together explain about 75% of the overall variance in the data.
